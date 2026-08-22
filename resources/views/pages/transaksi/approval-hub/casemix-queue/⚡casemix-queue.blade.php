@@ -988,6 +988,10 @@ new class extends Component {
         $fullSoap = $soapText;
         $medContext = $this->extractMedicationContext($refType, $refNo);
         if ($medContext) $fullSoap .= "\n\n" . $medContext;
+        $labContext = $this->extractLabContext($refType, $refNo);
+        if ($labContext) $fullSoap .= "\n\n" . $labContext;
+        $radContext = $this->extractRadiologiContext($refType, $refNo);
+        if ($radContext) $fullSoap .= "\n\n" . $radContext;
         if ($bridging['text']) $fullSoap .= "\n\n[Bridging sebelumnya]\n" . $bridging['text'];
 
         $initialDx = !empty($bridging['diagnosa']) ? $bridging['diagnosa'] : $existingDx;
@@ -1003,7 +1007,7 @@ new class extends Component {
             'ai_payload' => json_encode([
                 'diagnosa' => $initialDx,
                 'prosedur' => $bridging['prosedur'],
-                'soap_text' => mb_substr($fullSoap, 0, 6000),
+                'soap_text' => mb_substr($fullSoap, 0, 8000),
                 'has_bridging' => !empty($bridging['diagnosa']),
                 'emr_percent' => $emrPct['emr'],
                 'emr_sections' => $emrPct['sections'],
@@ -1201,6 +1205,93 @@ new class extends Component {
         return "[Obat yang diresepkan]\n" . $lines->implode("\n");
     }
 
+    private function extractLabContext(string $refType, string $refNo): string
+    {
+        $statusRjri = match (strtoupper($refType)) {
+            'RI' => 'RI',
+            'UGD' => 'UGD',
+            default => 'RJ',
+        };
+
+        $checkups = DB::table('lbtxn_checkuphdrs as h')
+            ->where('h.ref_no', $refNo)
+            ->where('h.status_rjri', $statusRjri)
+            ->where('h.checkup_status', 'H')
+            ->orderByDesc('h.checkup_date')
+            ->limit(3)
+            ->pluck('h.checkup_no');
+
+        if ($checkups->isEmpty()) return '';
+
+        $results = DB::table('lbtxn_checkupdtls as d')
+            ->join('lbmst_clabitems as i', 'i.clabitem_id', '=', 'd.clabitem_id')
+            ->whereIn('d.checkup_no', $checkups)
+            ->whereNotNull('d.lab_result')
+            ->whereRaw("TRIM(d.lab_result) IS NOT NULL")
+            ->select('i.clabitem_desc', 'd.lab_result', 'd.lab_result_status', 'i.unit_desc', 'i.is_group')
+            ->orderBy('d.checkup_no')
+            ->orderBy('d.checkup_dtl')
+            ->get()
+            ->filter(fn ($r) => $r->is_group !== 'Y' && trim($r->lab_result ?? '') !== '');
+
+        if ($results->isEmpty()) return '';
+
+        $lines = $results->map(function ($r) {
+            $line = "- {$r->clabitem_desc}: {$r->lab_result}";
+            if (!empty($r->unit_desc)) $line .= " {$r->unit_desc}";
+            $flag = strtoupper(trim($r->lab_result_status ?? ''));
+            if ($flag === 'H') $line .= " [TINGGI]";
+            elseif ($flag === 'L') $line .= " [RENDAH]";
+            return $line;
+        });
+
+        return "[Hasil laboratorium]\n" . $lines->implode("\n");
+    }
+
+    private function extractRadiologiContext(string $refType, string $refNo): string
+    {
+        $rows = match (strtoupper($refType)) {
+            'RI' => DB::table('rstxn_riradiologs as r')
+                ->join('rsmst_radiologis as m', 'm.rad_id', '=', 'r.rad_id')
+                ->where('r.rihdr_no', $refNo)
+                ->whereNotNull('r.hasil_bacaan')
+                ->select('m.rad_desc', 'r.hasil_bacaan', 'r.klinis_desc')
+                ->orderByDesc('r.tgl_bacaan')
+                ->limit(3)
+                ->get(),
+            'UGD' => DB::table('rstxn_ugdrads as r')
+                ->join('rsmst_radiologis as m', 'm.rad_id', '=', 'r.rad_id')
+                ->where('r.rj_no', $refNo)
+                ->whereNotNull('r.hasil_bacaan')
+                ->select('m.rad_desc', 'r.hasil_bacaan', 'r.klinis_desc')
+                ->orderByDesc('r.tgl_bacaan')
+                ->limit(3)
+                ->get(),
+            default => DB::table('rstxn_rjrads as r')
+                ->join('rsmst_radiologis as m', 'm.rad_id', '=', 'r.rad_id')
+                ->where('r.rj_no', $refNo)
+                ->whereNotNull('r.hasil_bacaan')
+                ->select('m.rad_desc', 'r.hasil_bacaan', 'r.klinis_desc')
+                ->orderByDesc('r.tgl_bacaan')
+                ->limit(3)
+                ->get(),
+        };
+
+        if ($rows->isEmpty()) return '';
+
+        $lines = $rows->map(function ($r) {
+            $bacaan = is_string($r->hasil_bacaan) ? strip_tags($r->hasil_bacaan) : '';
+            $bacaan = preg_replace('/\s+/', ' ', trim($bacaan));
+            $bacaan = mb_substr($bacaan, 0, 500);
+            $line = "- {$r->rad_desc}";
+            if (!empty($r->klinis_desc)) $line .= " (klinis: {$r->klinis_desc})";
+            $line .= ": {$bacaan}";
+            return $line;
+        });
+
+        return "[Hasil radiologi]\n" . $lines->implode("\n");
+    }
+
     private function callAiIcdSuggest(string $soapText, string $refType): ?array
     {
         $systemPrompt = <<<'PROMPT'
@@ -1221,6 +1312,17 @@ Aturan:
   * Kortikosteroid sistemik jangka panjang → pertimbangkan Z79.52
   * Obat antineoplastik/kemoterapi → pertimbangkan Z79.899
   * Bedakan DM dengan insulin (E11.65) vs DM tanpa insulin (E11.9) berdasarkan ada/tidaknya insulin di resep
+- Jika ada [Hasil laboratorium] di input, GUNAKAN hasil lab untuk memperkuat atau mengoreksi diagnosa:
+  * Nilai [TINGGI] atau [RENDAH] menunjukkan abnormalitas — kaitkan dengan diagnosa yang sesuai
+  * GDA/GDP/GD2PP tinggi → konfirmasi DM; HbA1c > 7% → DM tidak terkontrol
+  * Kreatinin tinggi → pertimbangkan CKD (N18.x); SGOT/SGPT tinggi → gangguan liver
+  * Hb rendah → anemia (D64.9); Leukosit tinggi → infeksi; Trombosit rendah → trombositopenia
+  * Gunakan hasil lab sebagai alasan (reason) di kode ICD yang dipilih
+- Jika ada [Hasil radiologi] di input, GUNAKAN bacaan radiologi untuk diagnosa tambahan:
+  * Cardiomegaly → I51.7; Efusi pleura → J91.8; Pneumonia → J18.9
+  * Fraktur → kode S/T sesuai lokasi; TB paru → A15.x
+  * Bacaan radiologi yang normal/tidak ada kelainan: JANGAN tambahkan diagnosa dari itu
+  * Gunakan temuan radiologi sebagai alasan (reason) di kode ICD yang dipilih
 - Confidence 0-100 berdasarkan keyakinan coding.
 - Setiap diagnosa/prosedur WAJIB punya "reason" — alasan singkat kenapa kode itu dipilih berdasarkan data SOAP dan obat. Jika kode dari bridging sebelumnya, sebutkan "sesuai bridging sebelumnya + [alasan klinis]".
 - "notes" berisi ringkasan keseluruhan: diagnosa utama karena apa, kenapa confidence segitu, dan temuan penting dari daftar obat.
