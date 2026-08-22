@@ -986,6 +986,8 @@ new class extends Component {
         $emrPct = $this->calculateEmrPercent($emr, $refType);
 
         $fullSoap = $soapText;
+        $medContext = $this->extractMedicationContext($refType, $refNo);
+        if ($medContext) $fullSoap .= "\n\n" . $medContext;
         if ($bridging['text']) $fullSoap .= "\n\n[Bridging sebelumnya]\n" . $bridging['text'];
 
         $initialDx = !empty($bridging['diagnosa']) ? $bridging['diagnosa'] : $existingDx;
@@ -1001,7 +1003,7 @@ new class extends Component {
             'ai_payload' => json_encode([
                 'diagnosa' => $initialDx,
                 'prosedur' => $bridging['prosedur'],
-                'soap_text' => mb_substr($fullSoap, 0, 4000),
+                'soap_text' => mb_substr($fullSoap, 0, 6000),
                 'has_bridging' => !empty($bridging['diagnosa']),
                 'emr_percent' => $emrPct['emr'],
                 'emr_sections' => $emrPct['sections'],
@@ -1165,6 +1167,40 @@ new class extends Component {
         }
     }
 
+    private function extractMedicationContext(string $refType, string $refNo): string
+    {
+        $query = match (strtoupper($refType)) {
+            'RI' => DB::table('rstxn_riobats as o')
+                ->join('immst_products as p', 'p.product_id', '=', 'o.product_id')
+                ->where('o.rihdr_no', $refNo)
+                ->select('p.product_name', 'o.riobat_qty as qty')
+                ->orderBy('o.riobat_date'),
+            'UGD' => DB::table('rstxn_ugdobats as o')
+                ->join('immst_products as p', 'p.product_id', '=', 'o.product_id')
+                ->where('o.rj_no', $refNo)
+                ->select('p.product_name', 'o.qty')
+                ->orderBy('o.rjobat_dtl'),
+            default => DB::table('rstxn_rjobats as o')
+                ->join('immst_products as p', 'p.product_id', '=', 'o.product_id')
+                ->where('o.rj_no', $refNo)
+                ->select('p.product_name', 'o.qty', 'o.rj_carapakai', 'o.status_kronis')
+                ->orderBy('o.rjobat_dtl'),
+        };
+
+        $meds = $query->get();
+
+        if ($meds->isEmpty()) return '';
+
+        $lines = $meds->map(function ($m) {
+            $line = "- {$m->product_name} (qty: {$m->qty})";
+            if (!empty($m->rj_carapakai)) $line .= " — {$m->rj_carapakai}";
+            if (!empty($m->status_kronis) && $m->status_kronis === 'Y') $line .= " [KRONIS]";
+            return $line;
+        });
+
+        return "[Obat yang diresepkan]\n" . $lines->implode("\n");
+    }
+
     private function callAiIcdSuggest(string $soapText, string $refType): ?array
     {
         $systemPrompt = <<<'PROMPT'
@@ -1178,21 +1214,29 @@ Aturan:
 - Untuk prosedur, hanya jika ada tindakan medis yang dilakukan (operasi, prosedur invasif, dll).
 - Konsultasi rawat jalan rutin TANPA tindakan: kosongkan prosedur.
 - Jika ada [Bridging sebelumnya] di input, itu adalah kode ICD yang sudah pernah dipakai untuk klaim BPJS pasien ini. PRIORITASKAN kode tersebut jika klinis masih sesuai dengan SOAP saat ini. Tambahkan kode baru jika diperlukan.
+- Jika ada [Obat yang diresepkan] di input, GUNAKAN informasi obat untuk menentukan kode ICD yang lebih spesifik:
+  * Insulin (Aspart/Lispro/Glargine/Detemir/Lantus/NovoRapid/Humalog/dll) → tambahkan kode penggunaan insulin jangka panjang (E1x.65 atau Z79.4)
+  * Antikoagulan (Warfarin/Heparin/Rivaroxaban) → pertimbangkan Z79.01
+  * Obat kronis [KRONIS] → pertimbangkan kode "long-term drug therapy" yang sesuai
+  * Kortikosteroid sistemik jangka panjang → pertimbangkan Z79.52
+  * Obat antineoplastik/kemoterapi → pertimbangkan Z79.899
+  * Bedakan DM dengan insulin (E11.65) vs DM tanpa insulin (E11.9) berdasarkan ada/tidaknya insulin di resep
 - Confidence 0-100 berdasarkan keyakinan coding.
-- Setiap diagnosa/prosedur WAJIB punya "reason" — alasan singkat kenapa kode itu dipilih berdasarkan data SOAP. Jika kode dari bridging sebelumnya, sebutkan "sesuai bridging sebelumnya + [alasan klinis]".
-- "notes" berisi ringkasan keseluruhan: diagnosa utama karena apa, kenapa confidence segitu.
+- Setiap diagnosa/prosedur WAJIB punya "reason" — alasan singkat kenapa kode itu dipilih berdasarkan data SOAP dan obat. Jika kode dari bridging sebelumnya, sebutkan "sesuai bridging sebelumnya + [alasan klinis]".
+- "notes" berisi ringkasan keseluruhan: diagnosa utama karena apa, kenapa confidence segitu, dan temuan penting dari daftar obat.
 
 Jawab HANYA dalam format JSON (tanpa markdown fence):
 {
   "diagnosa": [
-    {"code": "E11.9", "desc": "Type 2 diabetes mellitus without complications", "kategori": "Primary", "confidence": 90, "reason": "GDA 186 + keluhan sering BAK + terapi Glimepirid & Metformin"},
+    {"code": "E11.65", "desc": "Type 2 DM with hyperglycemia, long-term insulin use", "kategori": "Primary", "confidence": 95, "reason": "GDA 186 + Insulin Aspart di resep → DM tipe 2 dengan insulin"},
+    {"code": "Z79.4", "desc": "Long term (current) use of insulin", "kategori": "Secondary", "confidence": 95, "reason": "Insulin Aspart (NovoRapid) dalam daftar obat"},
     {"code": "I10", "desc": "Essential (primary) hypertension", "kategori": "Secondary", "confidence": 85, "reason": "TD 150/90 + terapi Amlodipine"}
   ],
   "prosedur": [
     {"code": "88.72", "desc": "Diagnostic ultrasound of heart", "confidence": 80, "reason": "Echo dilakukan sesuai catatan penunjang"}
   ],
-  "confidence": 85,
-  "notes": "DM tipe 2 sebagai Primary karena resource-intensive (terapi multipel). Confidence 85% karena SOAP lengkap tapi tidak ada hasil lab HbA1c."
+  "confidence": 90,
+  "notes": "DM tipe 2 dengan insulin sebagai Primary (E11.65 bukan E11.9 karena pasien pakai Insulin Aspart). Z79.4 ditambahkan sebagai Secondary. Confidence 90% karena SOAP + daftar obat konsisten."
 }
 PROMPT;
 
