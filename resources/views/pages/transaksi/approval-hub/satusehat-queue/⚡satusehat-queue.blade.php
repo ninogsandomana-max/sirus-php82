@@ -1614,6 +1614,12 @@ PROMPT;
                         $alergiItems = $alergiIsList ? $alergiData : ($alergiData ? [$alergiData] : []);
                         $hasAlergi = !empty($alergiItems);
                         $hasAlergiSnomed = collect($alergiItems)->contains(fn($a) => !empty($a['snomedCode'] ?? ''));
+
+                        $rjNoRef = $row->ref_no;
+                        $labCount = DB::table('rstxn_rjlabs')->where('rj_no', $rjNoRef)->count();
+                        $radRows = DB::table('rstxn_rjrads')->where('rj_no', $rjNoRef)->select('rad_upload_pdf_foto', 'rad_upload_pdf')->get();
+                        $radCount = $radRows->count();
+                        $radUploaded = $radRows->filter(fn($r) => !empty($r->rad_upload_pdf_foto) || !empty($r->rad_upload_pdf))->count();
                     @endphp
                     <tr class="transition hover:bg-surface-soft dark:hover:bg-gray-800/50"
                         wire:key="ss-{{ $row->approval_id }}">
@@ -1663,6 +1669,22 @@ PROMPT;
                             <div class="flex items-center gap-1 text-[10px] {{ $hasAlergiSnomed ? ($alergiTidakAda ? 'text-gray-500 dark:text-gray-400' : 'text-emerald-600 dark:text-emerald-400') : 'text-gray-400 dark:text-gray-500' }}">
                                 <span>{{ $hasAlergiSnomed ? ($alergiTidakAda ? '○' : '✓') : '—' }}</span>
                                 <span>{{ $hasAlergiSnomed ? ($alergiTidakAda ? 'Tidak ada alergi' : 'Alergi: ' . collect($alergiItems)->pluck('snomedDisplayEn')->filter()->implode(', ')) : 'Alergi belum diisi' }}</span>
+                            </div>
+                            {{-- Lab & Radiologi badges --}}
+                            <div class="flex items-center gap-2 mt-1.5">
+                                @if ($labCount > 0)
+                                    <span class="inline-flex items-center gap-0.5 text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+                                        Lab {{ $labCount }}
+                                    </span>
+                                @endif
+                                @if ($radCount > 0)
+                                    <span class="inline-flex items-center gap-0.5 text-[10px] font-medium px-1.5 py-0.5 rounded {{ $radUploaded > 0 ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300' }}">
+                                        Rad {{ $radUploaded }}/{{ $radCount }}
+                                        @if ($radUploaded > 0)
+                                            ✓foto
+                                        @endif
+                                    </span>
+                                @endif
                             </div>
                         </td>
 
